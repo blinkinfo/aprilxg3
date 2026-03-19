@@ -197,15 +197,15 @@ class FeatureEngineer:
 
     @staticmethod
     def create_labels(df: pd.DataFrame) -> pd.Series:
-        """Create binary labels: 1 if next candle closes higher, 0 otherwise.
+        """Create binary labels: 1 if next candle is green (close > open), 0 otherwise.
 
         Args:
-            df: DataFrame with 'close' column
+            df: DataFrame with 'close' and 'open' columns
 
         Returns:
             Series of 0/1 labels
         """
-        return (df["close"].shift(-1) > df["close"]).astype(int)
+        return (df["close"].shift(-1) > df["open"].shift(-1)).astype(int)
 
     @staticmethod
     def _compute_rsi(series: pd.Series, period: int) -> pd.Series:
