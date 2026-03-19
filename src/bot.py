@@ -2,12 +2,20 @@
 
 Preserves the 15-second pre-signal timing by design.
 Integrates: retraining gate messaging, signal strength labels, Optuna status.
+
+Fixes applied:
+- Resolution uses candle open/close from MEXC (matches Polymarket binary outcome)
+- Signals store candle slot timestamp; resolution only fires for PREVIOUS candles
+- Resolution waits >= 30 seconds into new candle for exchange data to settle
+- Dedup guard prevents double-resolution within the same window
+- Startup resolves any stale pending signals from prior sessions
+- All timestamps in UTC
 """
 import asyncio
 import logging
 import os
 import signal
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from .config import BotConfig
 from .data_fetcher import MEXCFetcher
@@ -17,6 +25,30 @@ from .signal_tracker import SignalTracker
 from .telegram_bot import TelegramBot
 
 logger = logging.getLogger(__name__)
+
+# Seconds into the new candle before we attempt resolution.
+# Gives MEXC time to finalize the previous candle's close price.
+RESOLUTION_DELAY_SECONDS = 30
+# Upper bound of the resolution window (avoid running too late).
+RESOLUTION_WINDOW_END = 90
+
+
+def _candle_slot_open(dt: datetime, period_minutes: int = 5) -> datetime:
+    """Return the open timestamp of the candle slot that `dt` falls in.
+
+    E.g. for period_minutes=5:
+        09:03:22 -> 09:00:00
+        09:07:45 -> 09:05:00
+        10:00:01 -> 10:00:00
+    """
+    total_minutes = dt.hour * 60 + dt.minute
+    slot_minute = (total_minutes // period_minutes) * period_minutes
+    return dt.replace(
+        hour=slot_minute // 60,
+        minute=slot_minute % 60,
+        second=0,
+        microsecond=0,
+    )
 
 
 class SignalBot:
@@ -30,12 +62,13 @@ class SignalBot:
         self.telegram = TelegramBot(config.telegram)
         self._running = False
         self._last_signal_candle_ts = None  # Prevent duplicate signals per candle
+        self._last_resolved_candle_ts = None  # Prevent double-resolution per candle
 
     async def start(self):
         """Start the bot."""
-        logger.info("="*50)
+        logger.info("=" * 50)
         logger.info("BTC 5m Signal Bot starting (aprilxg v2)...")
-        logger.info("="*50)
+        logger.info("=" * 50)
 
         # Create directories
         os.makedirs(self.config.data_dir, exist_ok=True)
@@ -58,6 +91,9 @@ class SignalBot:
             await self._train_model()
         else:
             logger.info(f"Model loaded (val_acc={self.model.val_accuracy:.4f})")
+
+        # Resolve any stale pending signals from previous session
+        await self._resolve_stale_signals()
 
         # Send startup message
         optuna_status = "ON" if self.config.model.enable_optuna_tuning else "OFF"
@@ -91,34 +127,36 @@ class SignalBot:
     async def _main_loop(self):
         """Main prediction loop.
 
-        CRITICAL: The 15-second pre-signal timing is preserved here.
-        prediction_lead_seconds controls when the signal fires before candle close.
+        CRITICAL timing design:
+        - Signal fires <= 15 seconds before candle close (prediction_lead_seconds).
+        - Resolution fires 30-90 seconds into the NEXT candle, ensuring the
+          previous candle is fully settled on MEXC.
+        - Dedup guards prevent duplicate signals AND duplicate resolutions.
         """
         logger.info("Entering main prediction loop")
 
         while self._running:
             try:
                 now = datetime.now(timezone.utc)
+                current_slot = _candle_slot_open(now)
 
-                # Check if it's time to predict (15 seconds before candle close)
-                seconds_in_candle = (now.minute % 5) * 60 + now.second
-                candle_duration = 5 * 60  # 300 seconds
-                seconds_until_close = candle_duration - seconds_in_candle
+                # Seconds elapsed within the current 5-min candle
+                seconds_in_candle = (now - current_slot).total_seconds()
+                seconds_until_close = 300 - seconds_in_candle
 
-                if seconds_until_close <= self.config.prediction_lead_seconds and seconds_until_close > 0:
-                    # Calculate current candle's open timestamp for dedup
-                    candle_open_minute = now.minute - (now.minute % 5)
-                    candle_ts = now.replace(minute=candle_open_minute, second=0, microsecond=0)
+                # --- SIGNAL: fire <= prediction_lead_seconds before candle close ---
+                if 0 < seconds_until_close <= self.config.prediction_lead_seconds:
+                    if self._last_signal_candle_ts != current_slot:
+                        await self._run_prediction_cycle(now, current_slot)
+                        self._last_signal_candle_ts = current_slot
 
-                    if self._last_signal_candle_ts != candle_ts:
-                        await self._run_prediction_cycle()
-                        self._last_signal_candle_ts = candle_ts
+                # --- RESOLUTION: fire 30-90 seconds into the new candle ---
+                if RESOLUTION_DELAY_SECONDS <= seconds_in_candle < RESOLUTION_WINDOW_END:
+                    if self._last_resolved_candle_ts != current_slot:
+                        await self._resolve_pending_signals(current_slot)
+                        self._last_resolved_candle_ts = current_slot
 
-                # Resolve pending signals after candle close (within first 15 seconds)
-                if seconds_in_candle < 15 and seconds_in_candle >= 5:
-                    await self._resolve_pending_signals()
-
-                # Check if model needs retraining
+                # --- RETRAIN: check if model needs retraining ---
                 if self.model.needs_retrain():
                     logger.info("Model retrain interval reached")
                     await self._train_model()
@@ -131,8 +169,13 @@ class SignalBot:
                 logger.error(f"Main loop error: {e}", exc_info=True)
                 await asyncio.sleep(10)
 
-    async def _run_prediction_cycle(self):
-        """Fetch data and make a prediction."""
+    async def _run_prediction_cycle(self, now: datetime, current_slot: datetime):
+        """Fetch data and make a prediction.
+
+        Args:
+            now: Current UTC datetime
+            current_slot: The open timestamp of the current 5-min candle
+        """
         try:
             # Fetch multi-timeframe data
             data = await self.fetcher.fetch_multi_timeframe(
@@ -151,19 +194,29 @@ class SignalBot:
             prediction = self.model.predict(df_5m, higher_tf)
 
             if prediction["signal"] in ("UP", "DOWN"):
-                # Record signal
+                # Get the current candle's open price from MEXC data.
+                # The last row in df_5m whose timestamp matches current_slot
+                # is the live candle — its 'open' is the candle open.
+                candle_open_price = float(df_5m["open"].iloc[-1])
+
+                # Store the candle slot timestamp as ISO string
+                candle_slot_iso = current_slot.isoformat()
+
+                # Record signal with candle slot info
                 sig = self.tracker.add_signal(
                     direction=prediction["signal"],
                     confidence=prediction["confidence"],
                     entry_price=prediction["current_price"],
+                    candle_slot_ts=candle_slot_iso,
+                    candle_open_price=candle_open_price,
                 )
 
-                # Send to Telegram with strength indicator
+                # Send to Telegram
                 msg = self.tracker.format_signal_message(sig, prediction)
                 await self.telegram.send_message(msg)
                 logger.info(
                     f"Signal sent: {prediction['signal']} [{prediction.get('strength', 'NORMAL')}] "
-                    f"@ ${prediction['current_price']:,.2f}"
+                    f"@ ${prediction['current_price']:,.2f} (slot={candle_slot_iso})"
                 )
             else:
                 logger.info(
@@ -174,29 +227,158 @@ class SignalBot:
         except Exception as e:
             logger.error(f"Prediction cycle error: {e}", exc_info=True)
 
-    async def _resolve_pending_signals(self):
-        """Resolve pending signals with the latest candle close price."""
-        pending = self.tracker.get_pending_signals()
-        if not pending:
+    async def _resolve_pending_signals(self, current_slot: datetime):
+        """Resolve pending signals whose candle has fully closed.
+
+        Only resolves signals whose candle_slot_ts is strictly BEFORE
+        current_slot, ensuring we never resolve a candle that's still live.
+
+        Fetches the specific closed candle by timestamp from MEXC and uses
+        its open/close prices for WIN/LOSS (matching Polymarket).
+
+        Args:
+            current_slot: The open timestamp of the current (live) candle
+        """
+        current_slot_iso = current_slot.isoformat()
+        resolvable = self.tracker.get_resolvable_signals(current_slot_iso)
+        if not resolvable:
             return
 
         try:
-            # Fetch latest candle to get close price
-            df = await self.fetcher.fetch_klines(interval="5m", limit=2)
-            if df.empty or len(df) < 2:
+            # Fetch enough recent candles to cover any pending signals.
+            # Most of the time we only need the last 2-3, but fetch more
+            # to handle edge cases (bot was down, multiple pending).
+            df = await self.fetcher.fetch_klines(interval="5m", limit=10)
+            if df.empty:
+                logger.warning("No candle data returned for resolution")
                 return
 
-            # The second-to-last candle is the one that just closed
-            close_price = float(df["close"].iloc[-2])
+            # Build a lookup: candle open timestamp -> (open_price, close_price)
+            # The 'timestamp' column in df is the candle open time (from MEXC).
+            candle_lookup = {}
+            for _, row in df.iterrows():
+                ts = row["timestamp"]
+                # Convert pandas Timestamp to an offset-aware datetime for comparison
+                if hasattr(ts, "isoformat"):
+                    key = ts.isoformat()
+                else:
+                    key = str(ts)
+                candle_lookup[key] = {
+                    "open": float(row["open"]),
+                    "close": float(row["close"]),
+                }
 
-            for sig in pending:
-                resolved = self.tracker.resolve_signal(sig.signal_id, close_price)
+            for sig in resolvable:
+                # Find the candle matching this signal's slot
+                candle_data = candle_lookup.get(sig.candle_slot_ts)
+
+                if candle_data is None:
+                    # Try matching without timezone suffix variations
+                    # MEXC returns UTC timestamps; our stored format might differ slightly
+                    matched = False
+                    try:
+                        sig_dt = datetime.fromisoformat(sig.candle_slot_ts)
+                        for key, val in candle_lookup.items():
+                            key_dt = datetime.fromisoformat(key)
+                            if abs((sig_dt - key_dt).total_seconds()) < 5:
+                                candle_data = val
+                                matched = True
+                                break
+                    except (ValueError, TypeError):
+                        pass
+
+                    if not matched:
+                        logger.warning(
+                            f"Signal #{sig.signal_id}: candle for slot {sig.candle_slot_ts} "
+                            f"not found in fetched data. Will retry next cycle."
+                        )
+                        continue
+
+                resolved = self.tracker.resolve_signal(
+                    sig.signal_id,
+                    candle_open=candle_data["open"],
+                    candle_close=candle_data["close"],
+                )
                 if resolved:
                     msg = self.tracker.format_resolution_message(resolved)
                     await self.telegram.send_message(msg)
 
         except Exception as e:
             logger.error(f"Signal resolution error: {e}", exc_info=True)
+
+    async def _resolve_stale_signals(self):
+        """Resolve any pending signals from previous bot sessions.
+
+        Called once at startup. Fetches historical candle data and resolves
+        any signals that should have been resolved while the bot was down.
+        """
+        pending = self.tracker.get_pending_signals()
+        if not pending:
+            return
+
+        logger.info(f"Found {len(pending)} stale pending signals at startup, attempting resolution...")
+
+        try:
+            # Fetch enough historical candles to cover stale signals
+            df = await self.fetcher.fetch_klines(interval="5m", limit=50)
+            if df.empty:
+                logger.warning("No candle data for stale signal resolution")
+                return
+
+            now = datetime.now(timezone.utc)
+            current_slot = _candle_slot_open(now)
+            current_slot_iso = current_slot.isoformat()
+
+            # Build candle lookup
+            candle_lookup = {}
+            for _, row in df.iterrows():
+                ts = row["timestamp"]
+                if hasattr(ts, "isoformat"):
+                    key = ts.isoformat()
+                else:
+                    key = str(ts)
+                candle_lookup[key] = {
+                    "open": float(row["open"]),
+                    "close": float(row["close"]),
+                }
+
+            resolvable = self.tracker.get_resolvable_signals(current_slot_iso)
+            resolved_count = 0
+
+            for sig in resolvable:
+                candle_data = None
+                try:
+                    sig_dt = datetime.fromisoformat(sig.candle_slot_ts)
+                    for key, val in candle_lookup.items():
+                        key_dt = datetime.fromisoformat(key)
+                        if abs((sig_dt - key_dt).total_seconds()) < 5:
+                            candle_data = val
+                            break
+                except (ValueError, TypeError):
+                    pass
+
+                if candle_data is None:
+                    logger.warning(
+                        f"Stale signal #{sig.signal_id}: candle for slot {sig.candle_slot_ts} "
+                        f"not found in historical data."
+                    )
+                    continue
+
+                resolved = self.tracker.resolve_signal(
+                    sig.signal_id,
+                    candle_open=candle_data["open"],
+                    candle_close=candle_data["close"],
+                )
+                if resolved:
+                    resolved_count += 1
+                    msg = self.tracker.format_resolution_message(resolved)
+                    await self.telegram.send_message(msg)
+
+            if resolved_count > 0:
+                logger.info(f"Resolved {resolved_count} stale signals at startup")
+
+        except Exception as e:
+            logger.error(f"Stale signal resolution error: {e}", exc_info=True)
 
     async def _train_model(self):
         """Train or retrain the model."""
@@ -226,7 +408,11 @@ class SignalBot:
             self.model.save(self.config.model_dir)
 
             # Notify with retraining gate status
-            swapped_str = "NEW MODEL ACTIVE" if metrics["model_swapped"] else "KEPT PREVIOUS MODEL (new one wasn't better)"
+            swapped_str = (
+                "NEW MODEL ACTIVE"
+                if metrics["model_swapped"]
+                else "KEPT PREVIOUS MODEL (new one wasn't better)"
+            )
             optuna_str = "Optuna-tuned" if metrics.get("optuna_tuned") else "Default params"
 
             msg = (
@@ -261,9 +447,16 @@ class SignalBot:
         for s in recent:
             result_str = s.result or "PENDING"
             pnl_str = f"{s.pnl_pct:+.4f}%" if s.pnl_pct is not None else "---"
+            slot_str = ""
+            if s.candle_slot_ts:
+                try:
+                    dt = datetime.fromisoformat(s.candle_slot_ts)
+                    slot_str = f" | {dt.strftime('%H:%M')} UTC"
+                except (ValueError, TypeError):
+                    slot_str = ""
             lines.append(
                 f"#{s.signal_id} | {s.direction} | ${s.entry_price:,.2f} | "
-                f"{result_str} | {pnl_str} | conf={s.confidence:.1%}"
+                f"{result_str} | {pnl_str} | conf={s.confidence:.1%}{slot_str}"
             )
         lines.append("------------------------------------")
         return "\n".join(lines)
@@ -281,13 +474,16 @@ class SignalBot:
         optuna_status = "ON" if self.config.model.enable_optuna_tuning else "OFF"
         tuned_str = "Yes" if self.model.best_xgb_params else "No (using defaults)"
 
+        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
         return (
             "---------- BOT STATUS (v2) ----------\n"
             f"Status: {'RUNNING' if self._running else 'STOPPED'}\n"
+            f"Current Time: {now_utc}\n"
             f"Symbol: {self.config.mexc.symbol}\n"
             f"Model accuracy: {self.model.val_accuracy:.1%}\n"
             f"Training samples: {self.model.train_samples}\n"
-            f"Last trained: {self.model.last_train_time.strftime('%Y-%m-%d %H:%M') if self.model.last_train_time else 'Never'}\n"
+            f"Last trained: {self.model.last_train_time.strftime('%Y-%m-%d %H:%M UTC') if self.model.last_train_time else 'Never'}\n"
             f"Next retrain in: {retrain_in}\n"
             f"Confidence threshold: {self.config.model.confidence_min:.0%}\n"
             f"Retraining gate: {self.config.model.retrain_min_improvement:.3f}\n"

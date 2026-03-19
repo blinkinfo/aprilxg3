@@ -1,4 +1,7 @@
-"""Signal tracking with win/loss, PnL, streaks, and statistics."""
+"""Signal tracking with win/loss, PnL, streaks, and statistics.
+
+Fixed: candle slot timestamps, open/close resolution, UTC time throughout.
+"""
 import json
 import logging
 import os
@@ -9,16 +12,42 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+def _format_slot(iso_ts: str) -> str:
+    """Format an ISO timestamp into a readable UTC slot string.
+
+    E.g. '2026-03-19T09:00:00+00:00' -> '09:00-09:05 UTC'
+    """
+    try:
+        dt = datetime.fromisoformat(iso_ts)
+        end = dt.replace(minute=dt.minute + 5) if dt.minute + 5 < 60 else dt.replace(
+            hour=dt.hour + 1, minute=(dt.minute + 5) % 60
+        )
+        return f"{dt.strftime('%H:%M')}-{end.strftime('%H:%M')} UTC"
+    except Exception:
+        return iso_ts[:19] + "Z"
+
+
+def _format_utc(iso_ts: str) -> str:
+    """Format an ISO timestamp to a short UTC string like '09:04:45 UTC'."""
+    try:
+        dt = datetime.fromisoformat(iso_ts)
+        return dt.strftime("%H:%M:%S UTC")
+    except Exception:
+        return iso_ts[:19] + "Z"
+
+
 @dataclass
 class Signal:
     """A single signal record."""
     signal_id: int
     direction: str  # UP or DOWN
     confidence: float
-    entry_price: float
-    timestamp: str
+    entry_price: float  # Candle OPEN price (for Polymarket accuracy)
+    timestamp: str  # When the signal was created (ISO UTC)
+    candle_slot_ts: str = ""  # Candle open timestamp in ISO UTC (e.g. 09:00:00)
+    candle_open_price: float = 0.0  # The candle's actual open price
     # Filled after candle closes
-    exit_price: Optional[float] = None
+    exit_price: Optional[float] = None  # Candle close price
     result: Optional[str] = None  # WIN, LOSS, or NEUTRAL
     pnl_pct: Optional[float] = None
     resolved_at: Optional[str] = None
@@ -59,13 +88,22 @@ class SignalTracker:
         self._session_start = datetime.now(timezone.utc).isoformat()
         self._load()
 
-    def add_signal(self, direction: str, confidence: float, entry_price: float) -> Signal:
+    def add_signal(
+        self,
+        direction: str,
+        confidence: float,
+        entry_price: float,
+        candle_slot_ts: str = "",
+        candle_open_price: float = 0.0,
+    ) -> Signal:
         """Add a new signal.
 
         Args:
             direction: UP or DOWN
             confidence: Model confidence (0-1)
-            entry_price: Price at signal time
+            entry_price: Current live price at signal time (kept for display)
+            candle_slot_ts: ISO UTC timestamp of the candle's open (e.g. 09:00:00)
+            candle_open_price: The candle's actual open price from MEXC
 
         Returns:
             The created Signal object
@@ -76,19 +114,33 @@ class SignalTracker:
             confidence=confidence,
             entry_price=entry_price,
             timestamp=datetime.now(timezone.utc).isoformat(),
+            candle_slot_ts=candle_slot_ts,
+            candle_open_price=candle_open_price,
         )
         self.signals.append(signal)
         self._next_id += 1
         self._save()
-        logger.info(f"Signal #{signal.signal_id}: {direction} @ ${entry_price:,.2f} (conf={confidence:.4f})")
+        logger.info(
+            f"Signal #{signal.signal_id}: {direction} @ ${entry_price:,.2f} "
+            f"(conf={confidence:.4f}, slot={candle_slot_ts})"
+        )
         return signal
 
-    def resolve_signal(self, signal_id: int, exit_price: float) -> Optional[Signal]:
-        """Resolve a pending signal with the exit price.
+    def resolve_signal(
+        self,
+        signal_id: int,
+        candle_open: float,
+        candle_close: float,
+    ) -> Optional[Signal]:
+        """Resolve a pending signal using the candle's open and close prices.
+
+        WIN/LOSS is determined by whether the candle closed in the predicted
+        direction relative to its OPEN price — matching Polymarket binary outcome.
 
         Args:
             signal_id: Signal ID to resolve
-            exit_price: Price at candle close
+            candle_open: The candle's open price
+            candle_close: The candle's close price
 
         Returns:
             The resolved Signal or None
@@ -97,31 +149,84 @@ class SignalTracker:
         if signal is None or signal.result is not None:
             return None
 
-        # Calculate PnL
+        # Determine actual candle direction
+        candle_went_up = candle_close > candle_open
+        candle_went_down = candle_close < candle_open
+
+        # Calculate PnL % based on candle open vs close
         if signal.direction == "UP":
-            pnl_pct = ((exit_price - signal.entry_price) / signal.entry_price) * 100
+            pnl_pct = ((candle_close - candle_open) / candle_open) * 100
         else:  # DOWN
-            pnl_pct = ((signal.entry_price - exit_price) / signal.entry_price) * 100
+            pnl_pct = ((candle_open - candle_close) / candle_open) * 100
 
-        # Determine result
-        if pnl_pct > 0:
+        # WIN/LOSS matches Polymarket: did the candle go in the predicted direction?
+        if signal.direction == "UP" and candle_went_up:
             signal.result = "WIN"
-        elif pnl_pct < 0:
-            signal.result = "LOSS"
-        else:
+        elif signal.direction == "DOWN" and candle_went_down:
+            signal.result = "WIN"
+        elif candle_open == candle_close:
             signal.result = "NEUTRAL"
+        else:
+            signal.result = "LOSS"
 
-        signal.exit_price = exit_price
+        # Store candle open as entry, candle close as exit
+        signal.candle_open_price = candle_open
+        signal.exit_price = candle_close
         signal.pnl_pct = round(pnl_pct, 4)
         signal.resolved_at = datetime.now(timezone.utc).isoformat()
 
         self._save()
-        logger.info(f"Signal #{signal_id} resolved: {signal.result} ({pnl_pct:+.4f}%)")
+        logger.info(
+            f"Signal #{signal_id} resolved: {signal.result} "
+            f"(open=${candle_open:,.2f} -> close=${candle_close:,.2f}, pnl={pnl_pct:+.4f}%)"
+        )
         return signal
 
     def get_pending_signals(self) -> list[Signal]:
         """Get all unresolved signals."""
         return [s for s in self.signals if s.result is None]
+
+    def get_resolvable_signals(self, current_candle_open_ts: str) -> list[Signal]:
+        """Get pending signals whose candle slot is OLDER than the current candle.
+
+        This prevents resolving a signal for a candle that hasn't closed yet.
+
+        Args:
+            current_candle_open_ts: ISO UTC timestamp of the current (live) candle's open
+
+        Returns:
+            List of signals safe to resolve
+        """
+        pending = self.get_pending_signals()
+        if not pending:
+            return []
+
+        try:
+            current_ts = datetime.fromisoformat(current_candle_open_ts)
+        except (ValueError, TypeError):
+            logger.error(f"Invalid current_candle_open_ts: {current_candle_open_ts}")
+            return []
+
+        resolvable = []
+        for s in pending:
+            if not s.candle_slot_ts:
+                # Legacy signal without slot timestamp — skip (can't verify age)
+                logger.warning(f"Signal #{s.signal_id} has no candle_slot_ts, skipping resolution")
+                continue
+            try:
+                signal_candle_ts = datetime.fromisoformat(s.candle_slot_ts)
+                if signal_candle_ts < current_ts:
+                    resolvable.append(s)
+                else:
+                    logger.debug(
+                        f"Signal #{s.signal_id} candle slot {s.candle_slot_ts} "
+                        f"not yet closed (current candle: {current_candle_open_ts})"
+                    )
+            except (ValueError, TypeError):
+                logger.warning(f"Signal #{s.signal_id} has invalid candle_slot_ts: {s.candle_slot_ts}")
+                continue
+
+        return resolvable
 
     def get_stats(self) -> TrackerStats:
         """Compute comprehensive statistics."""
@@ -228,33 +333,38 @@ class SignalTracker:
             "",
             "---------- Meta ----------",
             f"Avg Confidence: {s.avg_confidence:.4f}",
-            f"Session Start: {s.session_start[:19]}Z",
-            f"Last Signal: {s.last_signal_time[:19]}Z" if s.last_signal_time else "",
-            "====================================",
+            f"Session Start: {_format_utc(s.session_start)}",
         ]
+        if s.last_signal_time:
+            lines.append(f"Last Signal: {_format_utc(s.last_signal_time)}")
+        lines.append("====================================")
         return "\n".join(lines)
 
     def format_signal_message(self, signal: Signal, prediction: dict) -> str:
         """Format a new signal as a Telegram message.
 
-        Includes signal strength from confidence filtering.
+        Includes candle slot in UTC and signal strength.
         """
         direction_arrow = ">> UP" if signal.direction == "UP" else ">> DOWN"
         strength = prediction.get("strength", "NORMAL")
         strength_label = f" [{strength}]" if strength == "STRONG" else ""
 
+        slot_str = _format_slot(signal.candle_slot_ts) if signal.candle_slot_ts else "N/A"
+        sent_at_str = _format_utc(signal.timestamp)
+
         lines = [
             "========== BTC 5m SIGNAL ==========",
             "",
+            f"Slot: {slot_str}",
             f"Direction: {direction_arrow}{strength_label}",
             f"Confidence: {signal.confidence:.1%}",
             "",
-            f"Entry Price: ${signal.entry_price:,.2f}",
+            f"Current Price: ${signal.entry_price:,.2f}",
+            f"Candle Open: ${signal.candle_open_price:,.2f}",
             f"P(Up): {prediction.get('prob_up', 0):.1%} | P(Down): {prediction.get('prob_down', 0):.1%}",
             "",
             f"Model Accuracy: {prediction.get('model_accuracy', 0):.1%}",
-            f"Signal #{signal.signal_id}",
-            f"Time: {signal.timestamp[:19]}Z",
+            f"Signal #{signal.signal_id} | Sent: {sent_at_str}",
             "====================================",
         ]
         return "\n".join(lines)
@@ -268,19 +378,23 @@ class SignalTracker:
             result_label = "[LOSS]"
 
         stats = self.get_stats()
+        slot_str = _format_slot(signal.candle_slot_ts) if signal.candle_slot_ts else "N/A"
+        resolved_at_str = _format_utc(signal.resolved_at) if signal.resolved_at else "N/A"
 
         lines = [
             "---------- SIGNAL RESOLVED ----------",
             "",
+            f"Slot: {slot_str}",
             f"Signal #{signal.signal_id}: {signal.direction}",
             f"Result: {result_label}",
             "",
-            f"Entry: ${signal.entry_price:,.2f}",
-            f"Exit:  ${signal.exit_price:,.2f}",
+            f"Candle Open:  ${signal.candle_open_price:,.2f}",
+            f"Candle Close: ${signal.exit_price:,.2f}",
             f"PnL: {signal.pnl_pct:+.4f}%",
             "",
             f"Running W/L: {stats.wins}/{stats.losses} ({stats.win_rate:.1f}%)",
             f"Total PnL: {stats.total_pnl_pct:+.4f}%",
+            f"Resolved: {resolved_at_str}",
             "--------------------------------------",
         ]
         return "\n".join(lines)
@@ -313,9 +427,11 @@ class SignalTracker:
                 data = json.load(f)
             self._next_id = data.get("next_id", 1)
             self._session_start = data.get("session_start", self._session_start)
-            self.signals = [
-                Signal(**s) for s in data.get("signals", [])
-            ]
+            for s_data in data.get("signals", []):
+                # Handle legacy signals that don't have new fields
+                s_data.setdefault("candle_slot_ts", "")
+                s_data.setdefault("candle_open_price", 0.0)
+                self.signals.append(Signal(**s_data))
             logger.info(f"Loaded {len(self.signals)} signals from disk")
         except Exception as e:
             logger.error(f"Failed to load signals: {e}")
