@@ -57,9 +57,9 @@ class ModelConfig:
     atr_regime_lookback: int = 100  # Lookback period for ATR percentile
     # Optuna tuning (Improvement 5)
     enable_optuna_tuning: bool = True
-    optuna_n_trials: int = 15  # Bayesian optimization trials (reduced from 30 to fit Railway timeout)
+    optuna_n_trials: int = 30  # Bayesian optimization trials
     optuna_tune_interval_hours: int = 24  # Re-tune hyperparams every N hours
-    optuna_timeout_seconds: int = 180  # Hard cap per tuning session (3 min)
+    optuna_timeout_seconds: int = 500  # Hard cap per tuning session (~8 min)
     # Walk-forward retraining gate (Improvement 4)
     retrain_min_improvement: float = 0.002  # New model must beat old by this margin
     # XGBoost default params (may be overridden by Optuna)

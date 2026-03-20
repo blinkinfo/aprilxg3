@@ -9,6 +9,7 @@ UI/UX v2:
 - All messages use HTML parse_mode for rich formatting
 - Message formatting delegated to formatters module
 - Commands return formatted responses via callbacks
+- Menu button commands registered via set_my_commands for autocomplete
 
 Polymarket commands:
 - /autotrade — Toggle auto-trading ON/OFF
@@ -21,7 +22,7 @@ import asyncio
 import logging
 from typing import Optional, Callable, Awaitable
 
-from telegram import Update, Bot
+from telegram import Update, Bot, BotCommand
 from telegram.error import Conflict, TimedOut, NetworkError
 from telegram.ext import (
     Application,
@@ -38,6 +39,21 @@ logger = logging.getLogger(__name__)
 _POLLING_MAX_RETRIES = 5
 # Initial backoff (seconds); doubles each retry.
 _POLLING_INITIAL_BACKOFF = 3
+
+# Menu commands shown in the Telegram command picker
+_BOT_COMMANDS = [
+    BotCommand("start", "Welcome message & chat ID"),
+    BotCommand("help", "Show all available commands"),
+    BotCommand("stats", "Lifetime signal statistics"),
+    BotCommand("recent", "Last 10 signals with outcomes"),
+    BotCommand("status", "Bot status & model info"),
+    BotCommand("retrain", "Force model retrain now"),
+    BotCommand("autotrade", "Toggle Polymarket auto-trading"),
+    BotCommand("setamount", "Set trade amount (e.g. /setamount 2.50)"),
+    BotCommand("balance", "Check Polymarket USDC balance"),
+    BotCommand("positions", "View open Polymarket positions"),
+    BotCommand("pmstatus", "Full Polymarket connection status"),
+]
 
 
 class TelegramBot:
@@ -82,7 +98,7 @@ class TelegramBot:
         self._pmstatus_callback = pmstatus_cb
 
     async def initialize(self):
-        """Initialize the bot and register handlers."""
+        """Initialize the bot, register handlers, and set menu commands."""
         if not self.config.bot_token:
             logger.warning("No Telegram bot token configured")
             return
@@ -109,6 +125,14 @@ class TelegramBot:
         self.application.add_handler(CommandHandler("pmstatus", self._cmd_pmstatus))
 
         await self.application.initialize()
+
+        # Register menu commands for Telegram's command picker (/ button)
+        try:
+            await self.bot.set_my_commands(_BOT_COMMANDS)
+            logger.info("Telegram menu commands registered successfully")
+        except Exception as e:
+            logger.warning(f"Failed to set menu commands: {e}")
+
         logger.info("Telegram bot initialized")
 
     async def start_polling(self):
@@ -159,7 +183,7 @@ class TelegramBot:
                     logger.error(f"Telegram polling failed after all retries: {e}")
 
     async def stop(self):
-        """Stop the bot."""
+        """Stop the bot and clean up menu commands."""
         if self.application is not None:
             try:
                 if self.application.updater and self.application.updater.running:

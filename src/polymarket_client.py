@@ -61,7 +61,6 @@ class PolymarketClient:
         """
         try:
             from py_clob_client.client import ClobClient
-            from py_clob_client.clob_types import ApiCreds
 
             self._client = ClobClient(
                 host=CLOB_HOST,
@@ -99,19 +98,36 @@ class PolymarketClient:
     async def get_balance(self) -> dict:
         """Fetch USDC balance from Polymarket.
 
+        Uses get_balance_allowance() with AssetType.COLLATERAL which is the
+        correct method on ClobClient. Returns balance in wei, converted to USDC.
+
         Returns:
-            {success: bool, data: {balance: float, currency: str}, error: str|None}
+            {success: bool, data: {balance: float, allowance: float, currency: str}, error: str|None}
         """
         if not self._initialized:
             return {"success": False, "data": None, "error": "Client not initialized"}
 
         try:
-            balance = self._client.get_balance()
-            bal_float = float(balance) if balance is not None else 0.0
-            logger.info(f"Polymarket balance: {bal_float:.2f} USDC")
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+            result = self._client.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+
+            # Balance is returned in wei (micro-USDC). Divide by 1e6 for USDC.
+            balance_wei = int(result.get("balance", "0"))
+            allowance_wei = int(result.get("allowance", "0"))
+            bal_usdc = balance_wei / 1e6
+            allowance_usdc = allowance_wei / 1e6
+
+            logger.info(f"Polymarket balance: {bal_usdc:.2f} USDC")
             return {
                 "success": True,
-                "data": {"balance": bal_float, "currency": "USDC"},
+                "data": {
+                    "balance": bal_usdc,
+                    "allowance": allowance_usdc,
+                    "currency": "USDC",
+                },
                 "error": None,
             }
         except Exception as e:
@@ -143,7 +159,7 @@ class PolymarketClient:
 
         Returns:
             {success: bool, data: {condition_id, up_token_id, down_token_id,
-             slot_ts, slot_dt, question, outcomes, prices}, error: str|None}
+             slot_ts, slot_dt, question, outcomes, prices, neg_risk}, error: str|None}
         """
         if not self._initialized:
             return {"success": False, "data": None, "error": "Client not initialized"}
@@ -183,9 +199,7 @@ class PolymarketClient:
                 resp2.raise_for_status()
                 search_results = resp2.json()
 
-                # Search results can be events or markets
                 for item in search_results:
-                    # If it's an event with nested markets
                     if "markets" in item:
                         for m in item["markets"]:
                             q = (m.get("question") or "").lower()
@@ -238,7 +252,6 @@ class PolymarketClient:
                 prices = prices_raw
 
             # Map outcomes to token IDs
-            # outcomes[i] corresponds to clobTokenIds[i]
             up_token_id = None
             down_token_id = None
             for i, outcome in enumerate(outcomes):
@@ -257,6 +270,9 @@ class PolymarketClient:
             next_slot_ts = self.get_next_slot_timestamp()
             slot_dt = self.slot_to_datetime(next_slot_ts)
 
+            # Get neg_risk from market data (needed for order signing)
+            neg_risk = target_market.get("negRisk", False)
+
             market_data = {
                 "condition_id": condition_id,
                 "up_token_id": up_token_id,
@@ -268,6 +284,7 @@ class PolymarketClient:
                 "prices": [float(p) for p in prices] if prices else [],
                 "market_slug": target_market.get("slug", ""),
                 "enable_order_book": target_market.get("enableOrderBook", False),
+                "neg_risk": neg_risk,
             }
 
             logger.info(
@@ -284,11 +301,13 @@ class PolymarketClient:
             return {"success": False, "data": None, "error": str(e)}
 
     # ------------------------------------------------------------------
-    # Order Book
+    # Order Book / Pricing
     # ------------------------------------------------------------------
 
-    async def get_best_price(self, token_id: str, side: str = "BUY") -> Optional[float]:
-        """Get the best available price from the order book.
+    def get_best_price(self, token_id: str, side: str = "BUY") -> Optional[float]:
+        """Get the best available price from the CLOB order book.
+
+        Uses ClobClient.get_price() which is the correct SDK method.
 
         Args:
             token_id: The CLOB token ID
@@ -298,26 +317,13 @@ class PolymarketClient:
             Best price as float, or None if no orders available.
         """
         try:
-            resp = await self._http.get(
-                f"{CLOB_HOST}/order-book/{token_id}"
-            )
-            resp.raise_for_status()
-            book = resp.json()
-
-            if side == "BUY":
-                # Best ask price (lowest sell order) for buying
-                asks = book.get("asks", [])
-                if asks:
-                    return float(asks[0]["price"])
-            else:
-                # Best bid price (highest buy order) for selling
-                bids = book.get("bids", [])
-                if bids:
-                    return float(bids[0]["price"])
-
+            result = self._client.get_price(token_id, side)
+            price = result.get("price")
+            if price is not None:
+                return float(price)
             return None
         except Exception as e:
-            logger.error(f"Order book fetch failed: {e}")
+            logger.error(f"Price fetch failed: {e}")
             return None
 
     # ------------------------------------------------------------------
@@ -326,6 +332,11 @@ class PolymarketClient:
 
     async def place_trade(self, direction: str, amount: float) -> dict:
         """Place a market buy order on the correct Up/Down token.
+
+        Uses the correct py-clob-client API:
+        - OrderArgs for order parameters
+        - PartialCreateOrderOptions for neg_risk
+        - create_and_post_order() convenience method
 
         Args:
             direction: "UP" or "DOWN"
@@ -342,6 +353,13 @@ class PolymarketClient:
             return {"success": False, "data": None, "error": f"Invalid direction: {direction}"}
 
         try:
+            from py_clob_client.clob_types import (
+                OrderArgs,
+                OrderType,
+                PartialCreateOrderOptions,
+            )
+            from py_clob_client.order_builder.constants import BUY
+
             # Step 1: Discover the current market
             market_result = await self.get_current_market()
             if not market_result["success"]:
@@ -376,7 +394,7 @@ class PolymarketClient:
                 }
 
             # Step 4: Get best available price from order book
-            best_price = await self.get_best_price(token_id, side="BUY")
+            best_price = self.get_best_price(token_id, side="BUY")
             if best_price is None:
                 # Use 0.50 as a reasonable default for binary markets
                 best_price = 0.50
@@ -386,26 +404,43 @@ class PolymarketClient:
             # size = USDC amount / price per token
             size = round(amount / best_price, 2)
 
-            # Step 6: Place the order
+            # Step 6: Get neg_risk for proper order signing
+            neg_risk = market.get("neg_risk", False)
+            # Also try to get from CLOB directly as fallback
+            try:
+                neg_risk = self._client.get_neg_risk(token_id)
+            except Exception:
+                pass  # Use the value from Gamma API
+
+            # Step 7: Place the order using correct API
             logger.info(
                 f"Placing {direction} order: token={token_id[:16]}..., "
-                f"price={best_price}, size={size}, amount={amount} USDC"
+                f"price={best_price}, size={size}, amount={amount} USDC, "
+                f"neg_risk={neg_risk}"
             )
 
-            order_resp = self._client.create_and_post_order(
+            order_args = OrderArgs(
                 token_id=token_id,
                 price=best_price,
                 size=size,
-                side="BUY",
+                side=BUY,
             )
+
+            options = PartialCreateOrderOptions(
+                neg_risk=neg_risk,
+            )
+
+            order_resp = self._client.create_and_post_order(order_args, options)
 
             # Mark slot as traded
             self._last_traded_slot = slot_ts
 
             # Parse order response
             order_id = "unknown"
+            status = "PLACED"
             if isinstance(order_resp, dict):
                 order_id = order_resp.get("orderID", order_resp.get("id", "unknown"))
+                status = order_resp.get("status", "PLACED")
             elif hasattr(order_resp, "orderID"):
                 order_id = order_resp.orderID
             elif hasattr(order_resp, "id"):
@@ -421,6 +456,7 @@ class PolymarketClient:
                 "slot_ts": slot_ts,
                 "slot_dt": market["slot_dt"],
                 "question": market["question"],
+                "status": status,
                 "filled_at": datetime.now(timezone.utc).isoformat(),
             }
 
@@ -465,7 +501,7 @@ class PolymarketClient:
                         "size": float(pos.get("size", 0)),
                         "avg_price": float(pos.get("avgPrice", pos.get("price", 0))),
                         "current_value": float(pos.get("currentValue", pos.get("value", 0))),
-                        "pnl": float(pos.get("pnl", pos.get("realizedPnl", 0))),
+                        "pnl": float(pos.get("cashPnl", pos.get("pnl", pos.get("realizedPnl", 0)))),
                         "token_id": pos.get("asset", pos.get("tokenId", "")),
                     })
 
@@ -483,6 +519,8 @@ class PolymarketClient:
     async def is_connected(self) -> dict:
         """Check Polymarket connection health.
 
+        Uses ClobClient.get_ok() for API health + get_balance_allowance() for auth check.
+
         Returns:
             {connected: bool, balance: float|None, error: str|None}
         """
@@ -490,11 +528,17 @@ class PolymarketClient:
             return {"connected": False, "balance": None, "error": "Client not initialized"}
 
         try:
-            # Check CLOB API health
-            resp = await self._http.get(f"{CLOB_HOST}/")
-            api_ok = resp.status_code == 200
+            # Check CLOB API health using the SDK method
+            api_ok = False
+            try:
+                ok_resp = self._client.get_ok()
+                api_ok = ok_resp == "OK" or ok_resp is not None
+            except Exception:
+                # Fallback to HTTP check
+                resp = await self._http.get(f"{CLOB_HOST}/")
+                api_ok = resp.status_code == 200
 
-            # Check balance
+            # Check balance (also validates L2 auth works)
             bal_result = await self.get_balance()
             balance = bal_result["data"]["balance"] if bal_result["success"] else None
 
