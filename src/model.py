@@ -10,6 +10,8 @@ Fixes applied:
 - Added timeout guard to Optuna tuning to prevent container kills
 - Reduced Optuna CV folds from 3 to 2 for faster tuning on large datasets
 - Suppressed noisy xgboost deprecation warnings
+- Added MedianPruner to early-stop underperforming Optuna trials after fold 1
+- Increased default trials to 40 and timeout to 750s for better TPE convergence
 """
 import logging
 import os
@@ -111,7 +113,7 @@ class PredictionModel:
             }
 
             cv_scores = []
-            for train_idx, val_idx in tscv.split(X):
+            for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(X)):
                 X_tr, X_va = X.iloc[train_idx], X.iloc[val_idx]
                 y_tr, y_va = y.iloc[train_idx], y.iloc[val_idx]
 
@@ -122,13 +124,26 @@ class PredictionModel:
                     verbose=False,
                 )
                 val_proba = model.predict_proba(X_va)[:, 1]
-                cv_scores.append(log_loss(y_va, val_proba))
+                fold_loss = log_loss(y_va, val_proba)
+                cv_scores.append(fold_loss)
+
+                # Report intermediate CV fold result for pruning.
+                # After fold 0 completes, the pruner can compare this
+                # trial's loss against the median of completed trials
+                # and kill it early if it's clearly underperforming.
+                trial.report(np.mean(cv_scores), fold_idx)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
 
             return np.mean(cv_scores)
 
         study = optuna.create_study(
             direction="minimize",
             sampler=optuna.samplers.TPESampler(seed=42),
+            pruner=optuna.pruners.MedianPruner(
+                n_startup_trials=10,  # Let first 10 trials complete fully (TPE warm-up)
+                n_warmup_steps=0,     # Can prune after first CV fold
+            ),
         )
         study.optimize(
             objective,
@@ -145,9 +160,11 @@ class PredictionModel:
             "n_jobs": -1,
         })
 
-        completed = len(study.trials)
+        completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+        pruned = len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])
         logger.info(
-            f"Optuna finished: {completed}/{n_trials} trials completed, "
+            f"Optuna finished: {completed} completed, {pruned} pruned "
+            f"(out of {len(study.trials)} total trials), "
             f"best logloss: {study.best_value:.6f}"
         )
         logger.info(
