@@ -182,12 +182,12 @@ class PositionRedeemer:
 
             # Check EOA balance for gas
             eoa_balance = self._w3.eth.get_balance(self._eoa_address)
-            matic_balance = self._w3.from_wei(eoa_balance, "ether")
+            pol_balance = self._w3.from_wei(eoa_balance, "ether")
 
             self._initialized = True
             logger.info(
                 f"PositionRedeemer initialized: EOA={self._eoa_address}, "
-                f"Safe={self._funder_address}, POL={matic_balance:.4f}, "
+                f"Safe={self._funder_address}, POL={pol_balance:.4f}, "
                 f"RPC={self._polygon_rpc_url}"
             )
 
@@ -197,7 +197,7 @@ class PositionRedeemer:
                 "data": {
                     "eoa_address": self._eoa_address,
                     "safe_address": self._funder_address,
-                    "matic_balance": float(matic_balance),
+                    "pol_balance": float(pol_balance),
                     "chain_id": chain_id,
                 },
             }
@@ -542,14 +542,14 @@ class PositionRedeemer:
 
         # Step 2: Check MATIC balance for gas
         eoa_balance = self._w3.eth.get_balance(self._eoa_address)
-        matic_balance = self._w3.from_wei(eoa_balance, "ether")
-        if matic_balance < 0.005:  # Need at least ~0.005 POL for gas
+        pol_balance = self._w3.from_wei(eoa_balance, "ether")
+        if pol_balance < 0.005:  # Need at least ~0.005 POL for gas
             return {
                 "success": False,
                 "redeemed": [],
                 "skipped": len(positions),
                 "errors": [{
-                    "error": f"Insufficient POL for gas: {matic_balance:.6f} POL"
+                    "error": f"Insufficient POL for gas: {pol_balance:.6f} POL"
                 }],
                 "total_usdc": 0.0,
             }

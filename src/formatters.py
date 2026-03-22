@@ -461,6 +461,7 @@ def format_start(chat_id: int) -> str:
         "  /balance      Wallet balance",
         "  /positions    Open positions",
         "  /pmstatus     Connection status",
+        "  /redeem      Redeem resolved positions",
         "",
         f"\U0001f194 Chat ID: <code>{chat_id}</code>",
     ]
@@ -495,6 +496,7 @@ def format_help() -> str:
         "  /balance     Check wallet USDC balance",
         "  /positions   View open Polymarket positions",
         "  /pmstatus    Polymarket connection &amp; config status",
+        "  /redeem     \U0001f4b0  Redeem resolved positions on-chain",
         "",
         "\U0001f4a1 <b>Signal Strength</b>",
         f"  \u26a1 <b>STRONG</b> \u2014 Confidence \u2265 60%",

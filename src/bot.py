@@ -135,27 +135,27 @@ class SignalBot:
         else:
             logger.info("Polymarket integration disabled (no POLYMARKET_PRIVATE_KEY)")
 
-            # Initialize position redeemer for auto-redeeming resolved markets
-            if self.config.polymarket.auto_redeem:
-                self.position_redeemer = PositionRedeemer(
-                    private_key=self.config.polymarket.private_key,
-                    funder_address=self.config.polymarket.funder_address,
-                    signature_type=self.config.polymarket.signature_type,
-                    polygon_rpc_url=self.config.polymarket.polygon_rpc_url,
-                )
-                redeem_init = await self.position_redeemer.initialize()
-                if redeem_init["success"]:
-                    matic = redeem_init["data"]["matic_balance"]
-                    logger.info(f"PositionRedeemer ready (POL: {matic:.4f})")
-                    await self.telegram.send_message(
-                        formatters.format_redeem_status(
-                            self.position_redeemer.get_stats(),
-                            redeemer_initialized=True,
-                        )
+        # Initialize position redeemer (requires Polymarket to be enabled)
+        if self.config.polymarket.enabled and self.config.polymarket.auto_redeem:
+            self.position_redeemer = PositionRedeemer(
+                private_key=self.config.polymarket.private_key,
+                funder_address=self.config.polymarket.funder_address,
+                signature_type=self.config.polymarket.signature_type,
+                polygon_rpc_url=self.config.polymarket.polygon_rpc_url,
+            )
+            redeem_init = await self.position_redeemer.initialize()
+            if redeem_init["success"]:
+                pol_balance = redeem_init["data"]["pol_balance"]
+                logger.info(f"PositionRedeemer ready (POL: {pol_balance:.4f})")
+                await self.telegram.send_message(
+                    formatters.format_redeem_status(
+                        self.position_redeemer.get_stats(),
+                        redeemer_initialized=True,
                     )
-                else:
-                    logger.error(f"PositionRedeemer init failed: {redeem_init['error']}")
-                    self.position_redeemer = None
+                )
+            else:
+                logger.error(f"PositionRedeemer init failed: {redeem_init['error']}")
+                self.position_redeemer = None
 
         # Try loading existing model
         loaded = self.model.load(self.config.model_dir)
